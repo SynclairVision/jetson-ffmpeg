@@ -86,7 +86,9 @@ Build with stubs and custom dirs example:
     ./ffpatch.sh ../ffmpeg
     Go to ffmpeg sources directory configure and build ffmpeg with nvmpi enabled and your custom options 
     cd ../ffmpeg
-    ./configure --enable-shared --enable-nvmpi
+    sudo apt update
+    sudo apt install libx264-dev pkg-config
+    ./configure --enable-shared --enable-gpl --enable-nvmpi --enable-libx264
     make
     sudo make install
     
