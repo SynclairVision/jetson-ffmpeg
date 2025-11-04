@@ -56,7 +56,7 @@ This library provides the ability to use hardware acceleration for video encodin
 ### Building and usage
 **1.build and install library**
 
-    git clone https://github.com/Keylost/jetson-ffmpeg.git
+    git clone git@github.com:SynclairVision/jetson-ffmpeg.git
     cd jetson-ffmpeg
     mkdir build
     cd build
