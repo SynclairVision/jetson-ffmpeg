@@ -91,6 +91,7 @@ Build with stubs and custom dirs example:
     ./configure --enable-shared --enable-gpl --enable-nvmpi --enable-libx264
     make
     sudo make install
+    sudo ldconfig
     
 **3.using**
   
