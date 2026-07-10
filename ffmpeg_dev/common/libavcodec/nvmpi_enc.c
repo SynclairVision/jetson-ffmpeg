@@ -10,6 +10,9 @@
 #include "libavutil/opt.h"
 #include "libavutil/mem.h"
 
+#include <limits.h>
+#include <stddef.h>
+
 #include "version.h"
 
 //compatibility with ffmpeg 8.0+. FF_PROFILE renamed with AV_PROFILE
@@ -40,6 +43,7 @@ typedef struct {
 	nvmpictx* ctx;
 	int num_capture_buffers;
 	int packet_pool_size;
+	size_t packet_buffer_size;
 	int profile;
 	int level;
 	int rc;
@@ -48,58 +52,100 @@ typedef struct {
 	AVFrame *frame; //tmp frame
 }nvmpiEncodeContext;
 
-nvPacket* nvmpienc_nvPacket_alloc(AVCodecContext *avctx, int bufSize);
-void nvmpienc_nvPacket_free(nvPacket* nPkt);
-int nvmpienc_nvPacket_reset(nvPacket* nPkt, AVCodecContext *avctx, int bufSize);
+static nvPacket* nvmpienc_nvPacket_alloc(AVCodecContext *avctx, size_t buf_size);
+static void nvmpienc_nvPacket_free(nvPacket* nPkt);
+static int nvmpienc_nvPacket_reset(nvPacket* nPkt, AVCodecContext *avctx, size_t buf_size);
 int nvmpienc_initPktPool(AVCodecContext *avctx, int pktNum);
 int nvmpienc_deinitPktPool(AVCodecContext *avctx);
 
 //alloc nvPacket and AVPacket buffer;
-nvPacket* nvmpienc_nvPacket_alloc(AVCodecContext *avctx, int bufSize)
+static nvPacket* nvmpienc_nvPacket_alloc(AVCodecContext *avctx, size_t buf_size)
 {
-	AVPacket* pkt = av_packet_alloc();
-	nvPacket* nPkt = (nvPacket*)malloc(sizeof(nvPacket));
-	int res;
-	memset(nPkt, 0, sizeof(nvPacket));
-#if LIBAVCODEC_VERSION_MAJOR >= 60
-	if((res = ff_get_encode_buffer(avctx, pkt, bufSize, 0)))
-#else
-	if((res = ff_alloc_packet2(avctx,pkt,bufSize,bufSize)))
-#endif
-	{
-		av_packet_free(&pkt);
-		free(nPkt);
+	AVPacket* pkt = NULL;
+	nvPacket* n_pkt = NULL;
+	int ret;
+
+	if (!avctx || buf_size == 0 || buf_size > INT_MAX){
 		return NULL;
 	}
-	nPkt->privData = pkt;
-	nPkt->payload = pkt->data;
-	return nPkt;
-}
 
-void nvmpienc_nvPacket_free(nvPacket* nPkt)
-{
-	AVPacket* pkt = nPkt->privData;
-	av_packet_free(&pkt);
-	free(nPkt);
-}
-
-int nvmpienc_nvPacket_reset(nvPacket* nPkt, AVCodecContext *avctx, int bufSize)
-{
-	AVPacket* pkt = nPkt->privData;
-	int res;
-#if LIBAVCODEC_VERSION_MAJOR >= 60
-	if((res = ff_get_encode_buffer(avctx, pkt, bufSize, 0)))
-#else
-	if((res = ff_alloc_packet2(avctx,pkt,bufSize,bufSize)))
-#endif
-	{
-		return -1;
+	pkt = av_packet_alloc();
+	if(!pkt){
+		return NULL;
 	}
-	nPkt->payload = pkt->data;
-	nPkt->payload_size = 0;
-	nPkt->flags = 0;
-	nPkt->pts = 0;
+
+	n_pkt = av_mallocz(sizeof(*n_pkt));
+	if(!n_pkt){
+		av_packet_free(&pkt);
+		return NULL;
+	}
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+	ret = ff_get_encode_buffer(avctx, pkt, (int)buf_size, 0);
+#else
+	ret = ff_alloc_packet2(avctx, pkt, (int)buf_size, (int)buf_size);
+#endif
+	if(ret < 0){
+		av_packet_free(&pkt);
+		av_free(n_pkt);
+		return NULL;
+	}
+
+	n_pkt->privData = pkt;
+	n_pkt->payload = pkt->data;
+	n_pkt->payload_size = 0;
+	n_pkt->payload_capacity = buf_size;
+	n_pkt->flags = 0;
+	n_pkt->pts = 0;
+	return n_pkt;
+}
+
+static void nvmpienc_nvPacket_free(nvPacket* n_pkt)
+{
+	AVPacket* pkt;
+	if(!n_pkt){
+		return;
+	}
+	pkt = n_pkt->privData;
+	av_packet_free(&pkt);
+	av_free(n_pkt);
+}
+
+static int nvmpienc_nvPacket_reset(nvPacket* n_pkt, AVCodecContext *avctx, size_t buf_size)
+{
+	AVPacket* pkt;
+	int ret;
+
+	if(!n_pkt || !avctx || buf_size == 0 || buf_size > INT_MAX){
+		return AVERROR(EINVAL);
+	}
+
+	pkt = n_pkt->privData;
+	if(!pkt){
+		return AVERROR(EINVAL);
+	}
+
+	/*
+	* Previous ref to packet was moved to the caller by av_packet_move_ref, so backing packet should be empty
+	*/
+	av_packet_unref(pkt);
+
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+	ret = ff_get_encode_buffer(avctx, pkt, (int)buf_size, 0);
+#else
+	ret = ff_alloc_packet2(avctx, pkt, (int)buf_size, (int)buf_size);
+#endif
+	if(ret < 0){
+		return ret;
+	}
+
+	n_pkt->payload = pkt->data;
+	n_pkt->payload_size = 0;
+	n_pkt->payload_capacity = buf_size;
+	n_pkt->flags = 0;
+	n_pkt->pts = 0;
+
 	return 0;
+
 }
 
 //must call after nvmpi_create_encoder() to preallocate buffers
@@ -109,8 +155,12 @@ int nvmpienc_initPktPool(AVCodecContext *avctx, int pktNum)
 	//TODO free allocated mem on error
 	for(int i=0;i<pktNum;i++)
 	{
-		nvPacket* nPkt = nvmpienc_nvPacket_alloc(avctx, NVMPI_ENC_CHUNK_SIZE);
-		nvmpi_encoder_qEmptyPacket(nvmpi_context->ctx, nPkt);
+		nvPacket* n_pkt = nvmpienc_nvPacket_alloc(avctx, nvmpi_context->packet_buffer_size);
+		if(!n_pkt){
+			av_log(avctx, AV_LOG_ERROR, "Failed to allocate nvmpi packet pool entry %d of %d\n", i, pktNum);
+			return AVERROR(ENOMEM);
+		}
+		nvmpi_encoder_qEmptyPacket(nvmpi_context->ctx, n_pkt);
 	}
 	return 0;
 }
@@ -206,8 +256,28 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 
 		nvmpi_context->ctx = nvmpi_create_encoder(&param);
 		_ctx = nvmpi_context->ctx;
-		//TODO error handling. if(!_ctx)
-		nvmpienc_initPktPool(avctx,nvmpi_context->packet_pool_size);
+		if(!_ctx)
+		{
+			av_log(avctx, AV_LOG_ERROR,"Failed to create nvmpi encoder\n");
+			return AVERROR_EXTERNAL;
+		}
+		nvmpi_context->packet_buffer_size = nvmpi_encoder_get_packet_buffer_size(_ctx);
+
+		if(nvmpi_context->packet_buffer_size == 0 ||
+		   nvmpi_context->packet_buffer_size > INT_MAX){
+			av_log(avctx, AV_LOG_ERROR, "Invalid nvmpi encoder packet-buffer size: %zu\n", nvmpi_context->packet_buffer_size);
+			nvmpi_encoder_close(_ctx);
+			nvmpi_context->ctx = NULL;
+			return AVERROR(EINVAL);
+		}
+		ret = nvmpienc_initPktPool(avctx,nvmpi_context->packet_pool_size);
+		if(ret < 0){
+			av_log(avctx, AV_LOG_ERROR,"Failed to init nvmpi encoder packet pool\n");
+			nvmpi_encoder_close(_ctx);
+			nvmpi_context->ctx = NULL;
+			_ctx = NULL;
+			return ret;
+		}
 		i=0;
 		_nvframe.timestamp=0;
 
@@ -257,7 +327,13 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 			memset( avctx->extradata + avctx->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE );
 			
 			nvmpienc_nvPacket_free(nPkt);
-			nPkt = nvmpienc_nvPacket_alloc(avctx, NVMPI_ENC_CHUNK_SIZE);
+			nPkt = nvmpienc_nvPacket_alloc(avctx, nvmpi_context->packet_buffer_size);
+			if(!nPkt){
+				av_log(avctx, AV_LOG_ERROR, "Failed to allocate nvmpi packet pool entry for flushing\n");
+				nvmpi_encoder_close(_ctx);
+				nvmpi_context->ctx = NULL;
+				return AVERROR(ENOMEM);
+			}
 			
 			//return buffer to pool
 			nvmpi_encoder_qEmptyPacket(nvmpi_context->ctx, nPkt);
@@ -278,7 +354,13 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 				continue;
 			}
 			nvmpienc_nvPacket_free(nPkt);
-			nPkt = nvmpienc_nvPacket_alloc(avctx, NVMPI_ENC_CHUNK_SIZE);
+			nPkt = nvmpienc_nvPacket_alloc(avctx, nvmpi_context->packet_buffer_size);
+			if(!nPkt){
+				av_log(avctx, AV_LOG_ERROR, "Failed to allocate nvmpi packet pool entry for flushing\n");
+				nvmpi_encoder_close(_ctx);
+				nvmpi_context->ctx = NULL;
+				return AVERROR(ENOMEM);
+			}
 			nvmpi_encoder_qEmptyPacket(nvmpi_context->ctx, nPkt);
 		}
 		
@@ -368,14 +450,26 @@ static int ff_nvmpi_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
 	aPkt = (AVPacket*)(nPkt->privData);
 	//aPkt->dts=aPkt->pts=nPkt->pts;
 	aPkt->dts = aPkt->pts = av_rescale_q(nPkt->pts, NVENC_TIMEBASE, avctx->time_base);
-	av_shrink_packet(aPkt, nPkt->payload_size);
+	if(nPkt->payload_size > nPkt->payload_capacity || nPkt->payload_size > (size_t)aPkt->size){
+		av_log(avctx, AV_LOG_ERROR, "Invalid nvmpi packet size: payload=%zu capacity=%zu avpacket=%d\n",
+        nPkt->payload_size,
+        nPkt->payload_capacity,
+        aPkt->size);
+
+    	nvmpi_encoder_qEmptyPacket(nvmpi_context->ctx, nPkt);
+
+    	return AVERROR_INVALIDDATA;
+	}
+
+	av_shrink_packet(aPkt, (int)nPkt->payload_size);
 	if(nPkt->flags& AV_PKT_FLAG_KEY) aPkt->flags = AV_PKT_FLAG_KEY;
 	av_packet_move_ref(pkt, aPkt);
 	
-	if(nvmpienc_nvPacket_reset(nPkt, avctx, NVMPI_ENC_CHUNK_SIZE))
-	{
-		nvmpienc_nvPacket_free(nPkt);
-		return AVERROR(ENOMEM);
+	int reset_ret = nvmpienc_nvPacket_reset(nPkt, avctx, nvmpi_context->packet_buffer_size);
+
+	if (reset_ret < 0) {
+	    nvmpienc_nvPacket_free(nPkt);
+	    return reset_ret;
 	}
 	
 	nvmpi_encoder_qEmptyPacket(nvmpi_context->ctx, nPkt);
@@ -466,7 +560,13 @@ static av_cold int nvmpi_encode_close(AVCodecContext *avctx)
 				continue;
 			}
 			nvmpienc_nvPacket_free(nPkt);
-			nPkt = nvmpienc_nvPacket_alloc(avctx, NVMPI_ENC_CHUNK_SIZE);
+			nPkt = nvmpienc_nvPacket_alloc(avctx, nvmpi_context->packet_buffer_size);
+			if(!nPkt){
+				av_log(avctx, AV_LOG_ERROR, "Failed to allocate nvmpi packet pool entry for flushing\n");
+				nvmpi_encoder_close(nvmpi_context->ctx);
+				nvmpi_context->ctx = NULL;
+				return AVERROR(ENOMEM);
+			}
 			nvmpi_encoder_qEmptyPacket(nvmpi_context->ctx, nPkt);
 		}
 	}

@@ -2,9 +2,10 @@
 #define __NVMPI_H__
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stddef.h>
 
-//Maximum size of the encoded buffers on the capture plane in bytes 
-#define NVMPI_ENC_CHUNK_SIZE 2*1024*1024
+//Minumum size of the encoded buffers on the capture plane in bytes 
+#define NVMPI_ENC_MIN_CHUNK_SIZE (2U*1024U*1024U) //2MB
 
 typedef struct nvmpictx nvmpictx;
 
@@ -61,7 +62,13 @@ typedef struct _NVDECPARAM{
 
 typedef struct _NVPACKET{
 	unsigned long flags;
-	unsigned long payload_size;
+
+	//Number of valid encoded bytes currently stored in payload buffer
+	size_t payload_size;
+
+	// Number of bytes allocated for payload buffer
+	size_t payload_capacity;
+
 	unsigned char *payload;
 	unsigned long  pts;
 	//NVMPI_pkt pointer. used by encoder
@@ -102,6 +109,8 @@ extern "C" {
 	void nvmpi_encoder_qEmptyPacket(nvmpictx* ctx, nvPacket* packet);
 	//close encoder
 	int nvmpi_encoder_close(nvmpictx* ctx);
+	// maybe JUST MABYE check the buffer capacity before writing to it?
+	size_t nvmpi_encoder_get_packet_buffer_size(const nvmpictx *ctx);
 
 #ifdef __cplusplus
 }
