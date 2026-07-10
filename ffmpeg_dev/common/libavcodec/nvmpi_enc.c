@@ -65,7 +65,10 @@ static nvPacket* nvmpienc_nvPacket_alloc(AVCodecContext *avctx, size_t buf_size)
 	nvPacket* n_pkt = NULL;
 	int ret;
 
-	if (!avctx || buf_size == 0 || buf_size > INT_MAX){
+	if (!avctx || buf_size == 0 || buf_size > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE) {
+		if(avctx){
+			av_log(avctx, AV_LOG_ERROR, "Invalid arguments to nvmpienc_nvPacket_alloc: buf_size=%zu\n", buf_size);
+		}
 		return NULL;
 	}
 
@@ -84,11 +87,18 @@ static nvPacket* nvmpienc_nvPacket_alloc(AVCodecContext *avctx, size_t buf_size)
 #else
 	ret = ff_alloc_packet2(avctx, pkt, (int)buf_size, (int)buf_size);
 #endif
-	if(ret < 0){
-		av_packet_free(&pkt);
-		av_free(n_pkt);
-		return NULL;
-	}
+	if (ret < 0) {
+    av_log(
+        avctx,
+        AV_LOG_ERROR,
+        "Failed to allocate %zu-byte nvmpi packet: %s\n",
+        buf_size,
+        av_err2str(ret));
+
+    av_packet_free(&pkt);
+    av_free(n_pkt);
+    return NULL;
+}
 
 	n_pkt->privData = pkt;
 	n_pkt->payload = pkt->data;
@@ -115,7 +125,7 @@ static int nvmpienc_nvPacket_reset(nvPacket* n_pkt, AVCodecContext *avctx, size_
 	AVPacket* pkt;
 	int ret;
 
-	if(!n_pkt || !avctx || buf_size == 0 || buf_size > INT_MAX){
+	if(!n_pkt || !avctx || buf_size == 0 || buf_size > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE){
 		return AVERROR(EINVAL);
 	}
 
@@ -174,15 +184,11 @@ int nvmpienc_deinitPktPool(AVCodecContext *avctx)
 	
 	while(nvmpi_encoder_dqEmptyPacket(ctx, &nPkt) == 0)
 	{
-		AVPacket* pkt = nPkt->privData;
-		av_packet_free(&pkt);
-		free(nPkt);
+		nvmpienc_nvPacket_free(nPkt);
 	}
 	while(nvmpi_encoder_get_packet(ctx, &nPkt) == 0)
 	{
-		AVPacket* pkt = nPkt->privData;
-		av_packet_free(&pkt);
-		free(nPkt);
+		nvmpienc_nvPacket_free(nPkt);
 	}
 	
 	//TODO check that all mem returned to nothing
@@ -252,7 +258,14 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		int64_t shiftPts = 1000000/param.fps_n;
 		if(avctx->codec->id == AV_CODEC_ID_H264) param.codingType = NV_VIDEO_CodingH264;
 		else param.codingType = NV_VIDEO_CodingHEVC;
-		av_image_alloc(dst, linesize,avctx->width,avctx->height,avctx->pix_fmt,1);
+		ret = av_image_alloc(dst, linesize,avctx->width,avctx->height,avctx->pix_fmt,1);
+
+		if(ret < 0){
+			av_log(avctx, AV_LOG_ERROR, "Failed to allocate temporary nvmpi header frame: %s\n", av_err2str(ret));
+			av_frame_free(&nvmpi_context->frame);
+			return ret;
+		}
+
 
 		nvmpi_context->ctx = nvmpi_create_encoder(&param);
 		_ctx = nvmpi_context->ctx;
@@ -272,11 +285,21 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		}
 		ret = nvmpienc_initPktPool(avctx,nvmpi_context->packet_pool_size);
 		if(ret < 0){
-			av_log(avctx, AV_LOG_ERROR,"Failed to init nvmpi encoder packet pool\n");
-			nvmpi_encoder_close(_ctx);
-			nvmpi_context->ctx = NULL;
-			_ctx = NULL;
-			return ret;
+			av_log(
+        		avctx,
+        		AV_LOG_ERROR,
+        		"Failed to initialize temporary nvmpi packet pool\n");
+
+    		nvmpienc_deinitPktPool(avctx);
+    		nvmpi_encoder_close(_ctx);
+
+    		nvmpi_context->ctx = NULL;
+    		_ctx = NULL;
+
+    		av_freep(&dst[0]);
+    		av_frame_free(&nvmpi_context->frame);
+
+    		return ret;
 		}
 		i=0;
 		_nvframe.timestamp=0;
@@ -302,7 +325,7 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 				continue;
 
 			//find idr index
-			while(i<nPkt->payload_size)
+			while((size_t)i+4<nPkt->payload_size)
 			{
 				//check if nal start code
 				if(nPkt->payload[i] == 0 && nPkt->payload[i+1] == 0 && nPkt->payload[i+2] == 0 && nPkt->payload[i+3] == 0x01)
@@ -370,24 +393,89 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		nvmpi_context->ctx = NULL;
 	}
 
-	if(avctx->codec->id == AV_CODEC_ID_H264)
-	{
-		param.codingType = NV_VIDEO_CodingH264;
-		nvmpi_context->ctx=nvmpi_create_encoder(&param);
-	}
-	else if(avctx->codec->id == AV_CODEC_ID_HEVC)
-	{
-		param.codingType = NV_VIDEO_CodingHEVC;
-		nvmpi_context->ctx=nvmpi_create_encoder(&param);
-	}
-	//else TODO
-	
-	if(nvmpi_context->ctx)
-	{
-		nvmpienc_initPktPool(avctx,nvmpi_context->packet_pool_size);
-	}
-	//TODO error handling. if(!nvmpi_context->ctx)
 
+	int ret;
+
+	if (avctx->codec->id == AV_CODEC_ID_H264) {
+		param.codingType = NV_VIDEO_CodingH264;
+	}
+	else if (avctx->codec->id == AV_CODEC_ID_HEVC) {
+		param.codingType = NV_VIDEO_CodingHEVC;
+	}
+	else {
+		av_log(
+			avctx,
+			AV_LOG_ERROR,
+			"Unsupported codec for nvmpi encoder: %d\n",
+			avctx->codec->id);
+
+		av_frame_free(&nvmpi_context->frame);
+		return AVERROR(EINVAL);
+	}
+
+	nvmpi_context->ctx = nvmpi_create_encoder(&param);
+
+	if (!nvmpi_context->ctx) {
+		av_log(
+			avctx,
+			AV_LOG_ERROR,
+			"Failed to create nvmpi encoder\n");
+
+		av_frame_free(&nvmpi_context->frame);
+		return AVERROR_EXTERNAL;
+	}
+
+	/*
+	* This must be queried for the actual encoder instance.
+	* It cannot rely on the temporary global-header encoder.
+	*/
+	nvmpi_context->packet_buffer_size =
+		nvmpi_encoder_get_packet_buffer_size(
+			nvmpi_context->ctx);
+
+	if (nvmpi_context->packet_buffer_size == 0 ||
+		nvmpi_context->packet_buffer_size >
+			INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE) {
+
+		av_log(
+			avctx,
+			AV_LOG_ERROR,
+			"Invalid nvmpi encoder packet-buffer size: %zu\n",
+			nvmpi_context->packet_buffer_size);
+
+		nvmpi_encoder_close(nvmpi_context->ctx);
+		nvmpi_context->ctx = NULL;
+		av_frame_free(&nvmpi_context->frame);
+
+		return AVERROR(EINVAL);
+	}
+
+	av_log(
+		avctx,
+		AV_LOG_INFO,
+		"Initializing nvmpi packet pool: "
+		"%d entries, %zu bytes each\n",
+		nvmpi_context->packet_pool_size,
+		nvmpi_context->packet_buffer_size);
+
+	ret = nvmpienc_initPktPool(
+		avctx,
+		nvmpi_context->packet_pool_size);
+
+	if (ret < 0) {
+		av_log(
+			avctx,
+			AV_LOG_ERROR,
+			"Failed to initialize nvmpi packet pool: %d\n",
+			ret);
+
+		nvmpienc_deinitPktPool(avctx);
+		nvmpi_encoder_close(nvmpi_context->ctx);
+		nvmpi_context->ctx = NULL;
+		av_frame_free(&nvmpi_context->frame);
+
+		return ret;
+	}
 	return 0;
 }
 
@@ -450,13 +538,33 @@ static int ff_nvmpi_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
 	aPkt = (AVPacket*)(nPkt->privData);
 	//aPkt->dts=aPkt->pts=nPkt->pts;
 	aPkt->dts = aPkt->pts = av_rescale_q(nPkt->pts, NVENC_TIMEBASE, avctx->time_base);
-	if(nPkt->payload_size > nPkt->payload_capacity || nPkt->payload_size > (size_t)aPkt->size){
-		av_log(avctx, AV_LOG_ERROR, "Invalid nvmpi packet size: payload=%zu capacity=%zu avpacket=%d\n",
-        nPkt->payload_size,
-        nPkt->payload_capacity,
-        aPkt->size);
+	if (nPkt->payload_size > nPkt->payload_capacity ||
+    	nPkt->payload_size > (size_t)aPkt->size) {
 
-    	nvmpi_encoder_qEmptyPacket(nvmpi_context->ctx, nPkt);
+    	int reset_ret;
+
+    	av_log(
+        	avctx,
+        	AV_LOG_ERROR,
+        	"Invalid nvmpi packet size: "
+        	"payload=%zu capacity=%zu avpacket=%d\n",
+        	nPkt->payload_size,
+        	nPkt->payload_capacity,
+        	aPkt->size);
+
+    	reset_ret = nvmpienc_nvPacket_reset(
+        	nPkt,
+        	avctx,
+        	nvmpi_context->packet_buffer_size);
+
+    	if (reset_ret < 0) {
+        	nvmpienc_nvPacket_free(nPkt);
+    	}
+    	else {
+        	nvmpi_encoder_qEmptyPacket(
+        	    nvmpi_context->ctx,
+        	    nPkt);
+    	}
 
     	return AVERROR_INVALIDDATA;
 	}
