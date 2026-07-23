@@ -9,6 +9,12 @@
 #include <thread>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <cstdio>
+#include <cstring>
+
 #define MAX_BUFFERS 32
 #define TEST_ERROR(condition, message, errorCode)    \
 	if (condition)                               \
@@ -42,6 +48,7 @@ struct nvmpictx
 	uint32_t num_reference_frames;
 	uint32_t vbv_buffer_size; //virtual buffer size of the encoder
 	uint32_t packets_num;
+	size_t packet_buffer_size;
 
 	bool insert_sps_pps_at_idr;
 	bool max_perf; //enable max performance mode
@@ -59,6 +66,7 @@ struct nvmpictx
 	NVMPI_bufPool<nvPacket*>* pktPool;
 	int *output_plane_fd; //array to store dmabuf fd's
 };
+static bool calculate_encoder_packet_buffer_size(uint32_t width, uint32_t height, size_t *result);
 
 
 static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBuffer * buffer, NvBuffer * shared_buffer __attribute__((unused)), void *arg)
@@ -92,15 +100,48 @@ static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBu
 	}
 	else
 	{
-		pkt->pts = (v4l2_buf->timestamp.tv_usec % 1000000) + (v4l2_buf->timestamp.tv_sec * 1000000UL);
-		//AV_PKT_FLAG_KEY 0x0001. if current packet is keyframe then enc_metadata.KeyFrame should be 0x1, so it should be OK to just assign value
-		pkt->flags = enc_metadata.KeyFrame;
-		pkt->payload_size = buffer->planes[0].bytesused;
-		memcpy(pkt->payload, buffer->planes[0].data, pkt->payload_size);
-		
-		ctx->pktPool->qFilledBuf(pkt);
+    	const size_t encoded_size =
+          static_cast<size_t>(
+            buffer->planes[0].bytesused);
+
+		if (pkt->payload == nullptr ||
+			encoded_size > pkt->payload_capacity) {
+
+			std::fprintf(
+				stderr,
+				"[libnvmpi][E]: encoded packet exceeds "
+				"destination capacity: %zu > %zu; "
+				"dropping packet\n",
+				encoded_size,
+				pkt->payload_capacity);
+
+			ctx->pktPool->qEmptyBuf(pkt);
+		}
+		else
+		{
+			const uint64_t timestamp_us =
+				static_cast<uint64_t>(
+					v4l2_buf->timestamp.tv_sec) *
+					1000000ULL +
+				static_cast<uint64_t>(
+					v4l2_buf->timestamp.tv_usec);
+
+			pkt->pts =
+				static_cast<unsigned long>(timestamp_us);
+
+			pkt->flags =
+				enc_metadata.KeyFrame ? 0x0001UL : 0UL;
+
+			pkt->payload_size = encoded_size;
+
+			std::memcpy(
+				pkt->payload,
+				buffer->planes[0].data,
+				encoded_size);
+
+			ctx->pktPool->qFilledBuf(pkt);
+		}
 	}
-	
 	if (ctx->enc->capture_plane.qBuffer(*v4l2_buf, NULL) < 0)
 	{
 		//TODO error handling
@@ -201,6 +242,11 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	ctx->index=0;
 	ctx->width=param->width;
 	ctx->height=param->height;
+	if(!calculate_encoder_packet_buffer_size(ctx->width, ctx->height, &ctx->packet_buffer_size)){
+		std::cerr << "Failed to calculate encoder packet buffer size" << std::endl;
+		delete ctx;
+		return nullptr;
+	}
 	ctx->enableLossless=false;
 	ctx->bitrate=param->bitrate;
 	ctx->ratecontrol = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;	
@@ -335,8 +381,14 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 		ctx->enc = NvVideoEncoder::createVideoEncoder("enc0", O_NONBLOCK);
 	}
 	TEST_ERROR(!ctx->enc, "Could not create encoder",ret);
-
-	ret = ctx->enc->setCapturePlaneFormat(ctx->encoder_pixfmt, ctx->width,ctx->height, NVMPI_ENC_CHUNK_SIZE);
+	if(ctx->packet_buffer_size > static_cast<size_t>(std::numeric_limits<uint32_t>::max())){
+		cerr << "Encoder packet buffer size exceeds V4L2 limit" << endl;
+		delete ctx->enc;
+		delete ctx->pktPool;
+		delete ctx;
+		return nullptr;
+	}
+	ret = ctx->enc->setCapturePlaneFormat(ctx->encoder_pixfmt, ctx->width,ctx->height, static_cast<uint32_t>(ctx->packet_buffer_size));
 
 	TEST_ERROR(ret < 0, "Could not set output plane format", ret);
 
@@ -709,3 +761,26 @@ int nvmpi_encoder_close(nvmpictx* ctx)
 	return 0;
 }
 
+
+static bool calculate_encoder_packet_buffer_size(uint32_t width, uint32_t height, size_t *result){
+	if(result == nullptr || width == 0 || height == 0) return false;
+
+	// Use the size of one uncompressed YUV420 frame as conservative encoded-frame buffer cap
+
+	const uint64_t raw_frame_size = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 3ULL / 2ULL;
+
+	const uint64_t min_size = static_cast<uint64_t>(NVMPI_ENC_MIN_CHUNK_SIZE);
+	const uint64_t selected_size = std::max(raw_frame_size, min_size);
+
+	if(selected_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())){
+		return false;
+	}
+
+	*result = static_cast<size_t>(selected_size);
+	return true;
+}
+
+size_t nvmpi_encoder_get_packet_buffer_size(const nvmpictx* ctx){
+	if(ctx == nullptr) return 0;
+	return ctx->packet_buffer_size;
+}
